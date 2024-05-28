@@ -1,0 +1,133 @@
+#!/bin/bash
+# shellcheck disable=SC2046
+# reptaur
+# REPosiTory/AUR package manager
+# A simple wrapper around pacman and the AUR API
+# Depends:
+# sudo
+# pacman
+# curl
+# jq
+# awk
+# wc
+# make
+# References:
+# https://wiki.archlinux.org/title/Aurweb_RPC_interface
+# https://wiki.archlinux.org/title/Pacman
+
+is_yes_reply() { read -rp "$1? [y/N]: "; [[ ${REPLY,,} =~ ^y(es)?$ ]]; }
+
+pacman_has_package() { pacman -Si "$1" &>/dev/null; }
+
+aur_get() { curl -s "https://aur.archlinux.org/rpc/v5/$1" | jq -r "$2"; }
+
+aur_has_package() { (( $(aur_get "info?arg[]=$1" '.resultcount') )); }
+
+aur_install_depends() {
+    if reptaur_is_installed "$1"; then
+        printf 'Depend %s is installed\n' "$1"
+    else
+        if pacman_has_package "$1"; then
+            sudo pacman -S "$1"
+        else
+            printf 'Depend %s not found in pacman repositories\n' "$1"
+        fi
+    fi
+}
+
+aur_install() {
+    printf '%s depends on:\n' "$1"
+    aur_get "info?arg[]=$1" '.results[].Depends[]?'
+    is_yes_reply 'Install depends'&& {
+        for pkg in $(aur_get "info?arg[]=$1" '.results[].Depends[]?'); do
+            aur_install_depends "$pkg"
+        done
+    }
+
+    curl -L "https://aur.archlinux.org/cgit/aur.git/snapshot/$1.tar.gz" |
+        tar -xzC "/tmp"
+    cd "/tmp/$1" || exit
+            
+    mapfile -t <PKGBUILD
+    printf '%s\n' "${MAPFILE[@]}"
+
+    is_yes_reply "Build package $1"|| {
+        printf 'PKGBUILD aborted.. Dependencies may need to be manually removed\n'
+        return 1
+    }
+    makepkg -si
+}
+
+reptaur_is_installed() { pacman -Qi "$1" &>/dev/null; }
+
+reptaur_sync() {
+    sudo pacman -Syu
+
+    IFS=$'\n'
+    for _ in $(pacman -Qm); do
+        pkg="${_% *}" ver="${_#* }"
+        latestVer=$(aur_get "info?arg[]=$pkg" '.results[] | "\(.Version)"')
+
+        [[ $latestVer != "$ver" ]]&& {
+            printf 'Updating AUR package %s from version %s to version %s \n' \
+                "$pkg" "$ver" "$latestVer"
+            aur_install "$pkg"
+        } 
+    done
+}
+
+reptaur_info() {
+    if [[ $1 ]]; then
+        if pacman -Si "$1" 2>/dev/null; then
+            return
+        elif aur_has_package "$1"; then
+            aur_get "info?arg[]=$1"
+        else
+            printf 'Package %s not found in pacman repositories or the AUR\n' "$1"
+        fi
+    else
+        pacmanInstalledKb=$(
+            pacman -Qi $(pacman -Qqn) |
+                awk '/^Installed Size/{total+=$4} END {printf "%.0f\n", total}'
+        )
+        aurInstalledKb=$(
+            pacman -Qmi $(pacman -Qqm) |
+                awk '/^Installed Size/{total+=$4} END {printf "%.0f\n", total}'
+        )
+        ((totalInstalledKb=pacmanInstalledKb+${aurInstalledKb:=0}))
+
+        printf '%s\n' \
+            "Pacman packages: $(pacman -Qn | wc -l)" \
+            "AUR packages: $(pacman -Qm | wc -l)" \
+            "Total package installed: $(pacman -Q | wc -l)" \
+            "Pacman installed size: $pacmanInstalledKb" \
+            "AUR installed size: $aurInstalledKb" \
+            "Total installed size: $totalInstalledKb"
+    fi
+}
+
+reptaur_query() {
+    aur_get "search/$1?name-desc" \
+        '.results[] | "aur/\(.Name) \(.Version)\n    \(.Description)"'
+
+    pacman -Ss "$1"
+}
+
+reptaur_install() {
+    reptaur_is_installed "$1"&& {
+        is_yes_reply "Reinstall $1"|| return 1
+    }
+    pacman_has_package "$1"&& { sudo pacman -S "$1"; return; }
+
+    aur_install "$1"
+}
+
+reptaur_remove() { sudo pacman -Runss "$1"; }
+
+case $1 in
+    ''|sync|-s|--sync) reptaur_sync;;
+    info|-i|--info) reptaur_info "$2";;
+    query|-q|--query) reptaur_query "$2";;
+    install|-I|--install) reptaur_install "$2";;
+    remove|-r|--remove) reptaur_remove "$2";;
+esac
