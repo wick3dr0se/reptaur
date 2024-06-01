@@ -15,11 +15,13 @@
 # https://wiki.archlinux.org/title/Aurweb_RPC_interface
 # https://wiki.archlinux.org/title/Pacman
 
+aur="https://aur.archlinux.org"
+
 is_yes_reply() { read -rp "$1? [y/N]: "; [[ ${REPLY,,} =~ ^y(es)?$ ]]; }
 
 pacman_has_package() { pacman -Si "$1" &>/dev/null; }
 
-aur_get() { curl -s "https://aur.archlinux.org/rpc/v5/$1" | jq -r "$2"; }
+aur_get() { curl -s "$aur/rpc/v5/$1" | jq -r "$2"; }
 
 aur_has_package() { (( $(aur_get "info?arg[]=$1" '.resultcount') )); }
 
@@ -44,8 +46,7 @@ aur_install() {
         done
     }
 
-    curl -L "https://aur.archlinux.org/cgit/aur.git/snapshot/$1.tar.gz" |
-        tar -xzC "/tmp"
+    curl -L "$aur/cgit/aur.git/snapshot/$1.tar.gz" | tar -xzC "/tmp/"
     cd "/tmp/$1" || exit
             
     mapfile -t <PKGBUILD
@@ -107,10 +108,10 @@ reptaur_info() {
 }
 
 reptaur_query() {
-    aur_get "search/$1?name-desc" \
+    aur_get "search/${*// /\%20}?name-desc" \
         '.results[] | "aur/\(.Name) \(.Version)\n    \(.Description)"'
 
-    pacman -Ss "$1"
+    pacman -Ss "$@"
 }
 
 reptaur_install() {
@@ -127,7 +128,7 @@ reptaur_remove() { sudo pacman -Runss "$1"; }
 case $1 in
     ''|sync|-s|--sync) reptaur_sync;;
     info|-i|--info) reptaur_info "$2";;
-    query|-q|--query) reptaur_query "$2";;
+    query|-q|--query) shift; reptaur_query "$@";;
     install|-I|--install) reptaur_install "$2";;
     remove|-r|--remove) reptaur_remove "$2";;
 esac
