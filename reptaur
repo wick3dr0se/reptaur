@@ -4,13 +4,14 @@
 # REPosiTory/AUR package manager
 # A simple wrapper around pacman and the AUR API
 # Depends:
-# sudo
 # pacman
 # curl
 # jq
 # awk
 # wc
 # make
+# debugedit
+# fakeroot
 # References:
 # https://wiki.archlinux.org/title/Aurweb_RPC_interface
 # https://wiki.archlinux.org/title/Pacman
@@ -19,38 +20,80 @@ aur="https://aur.archlinux.org"
 
 is_yes_reply() { read -rp "$1? [y/N]: "; [[ ${REPLY,,} =~ ^y(es)?$ ]]; }
 
+pacman_is_package_installed() { pacman -Qi "$1" &>/dev/null; }
+
 pacman_has_package() { pacman -Si "$1" &>/dev/null; }
 
-aur_get() { curl -s "$aur/rpc/v5/$1" | jq -r "$2"; }
+pacman_installed_size() {
+    pacman -Qi $(pacman -Qqn) |
+        awk '/^Installed Size/{total+=$4} END {printf "%.0f", total/1024}'
+}
+
+pacman_sync() {
+    if (( EUID )); then
+        printf 'Not running as root. Skipping pacman updates..\n'
+    else
+        pacman -Syu
+    fi
+}
+
+aur_get() { curl -s "$aur/rpc/v5/$1"| jq -r "$2"; }
+
+aur_package_info() { aur_get "info?arg[]=$1" "$2"; }
+
+aur_is_package_installed() {
+    pacman -Qm | awk -v pkg="$1" '$1 == pkg {found=1} END {exit !found}'
+}
 
 aur_has_package() { (( $(aur_get "info?arg[]=$1" '.resultcount') )); }
 
+aur_installed_size() {
+    pacman -Qmi $(pacman -Qqm) |
+        awk '/^Installed Size/{total+=$4} END {printf "%.0f", total/1024}'
+}
+
 aur_install_depends() {
-    if reptaur_is_installed "$1"; then
+    if pacman_is_package_installed "$1"; then
         printf 'Depend %s is installed\n' "$1"
     else
         if pacman_has_package "$1"; then
-            sudo pacman -S "$1"
+            pacman -S "$1"
         else
             printf 'Depend %s not found in pacman repositories\n' "$1"
         fi
     fi
 }
 
-aur_install() {
-    printf '%s depends on:\n' "$1"
-    aur_get "info?arg[]=$1" '.results[].Depends[]?'
-    is_yes_reply 'Install depends'&& {
-        for pkg in $(aur_get "info?arg[]=$1" '.results[].Depends[]?'); do
-            aur_install_depends "$pkg"
-        done
-    }
+aur_query() {
+    aur_get "search/${*// /\%20}?name-desc" \
+        '.results[] | "aur/\(.Name) \(.Version)\n    \(.Description)"'
+}
 
-    curl -L "$aur/cgit/aur.git/snapshot/$1.tar.gz" | tar -xzC "/tmp/"
-    cd "/tmp/$1" || exit
-            
+aur_install() {
+    local pkg_name pkg depends
+
+    : '.results[] | "\(.PackageBase), \(.Depends | join(", "))"'
+    read -r pkg_name depends < <(aur_package_info "$1" "$_")
+
+    [[ $depends ]]&& {
+        printf '%s depends on:\n%s\n' "$1" "$depends"
+
+        is_yes_reply 'Install depends'&& {
+            for pkg in $depends; do
+                aur_install_depends "$pkg"
+            done
+        }
+    }
+    
+    curl -L "$aur/cgit/aur.git/snapshot/$pkg_name.tar.gz"| tar -xzC '/tmp/'
+    cd "/tmp/$pkg_name"|| exit
+
     mapfile -t <PKGBUILD
     printf '%s\n' "${MAPFILE[@]}"
+
+    is_yes_reply "Edit $1 PKGBUILD"&& {
+        ${EDITOR:-${VISUAL:-vim}} "/tmp/$pkg_name/PKGBUILD"
+    }
 
     is_yes_reply "Build package $1"|| {
         printf 'PKGBUILD aborted.. Dependencies may need to be manually removed\n'
@@ -59,11 +102,13 @@ aur_install() {
     makepkg -si
 }
 
-reptaur_is_installed() { pacman -Qi "$1" &>/dev/null; }
-
 reptaur_sync() {
-    sudo pacman -Syu
+    local pkg ver latestVer
 
+    pacman_sync
+
+    # needs to be modified to parse from version trackign file
+    # or some way to get proper versions
     IFS=$'\n'
     for _ in $(pacman -Qm); do
         pkg="${_% *}" ver="${_#* }"
@@ -78,52 +123,47 @@ reptaur_sync() {
 }
 
 reptaur_info() {
+    local pacmanInstalledSize aurInstalledSize totalInstalledSize
+
     if [[ $1 ]]; then
-        if pacman -Si "$1" 2>/dev/null; then
+        if pacman_has_package "$1"; then
             return
         elif aur_has_package "$1"; then
-            aur_get "info?arg[]=$1"
+            aur_package_info "$1"
         else
             printf 'Package %s not found in pacman repositories or the AUR\n' "$1"
         fi
     else
-        pacmanInstalledKb=$(
-            pacman -Qi $(pacman -Qqn) |
-                awk '/^Installed Size/{total+=$4} END {printf "%.0f\n", total}'
-        )
-        aurInstalledKb=$(
-            pacman -Qmi $(pacman -Qqm) |
-                awk '/^Installed Size/{total+=$4} END {printf "%.0f\n", total}'
-        )
-        ((totalInstalledKb=pacmanInstalledKb+${aurInstalledKb:=0}))
+        pacmanInstalledSize=$(pacman_installed_size)
+        aurInstalledSize=$(aur_installed_size)
+        ((totalInstalledSize=pacmanInstalledSize+${aurInstalledSize:=0}))
 
         printf '%s\n' \
             "Pacman packages: $(pacman -Qn | wc -l)" \
             "AUR packages: $(pacman -Qm | wc -l)" \
-            "Total package installed: $(pacman -Q | wc -l)" \
-            "Pacman installed size: $pacmanInstalledKb" \
-            "AUR installed size: $aurInstalledKb" \
-            "Total installed size: $totalInstalledKb"
+            "Total packages installed: $(pacman -Q | wc -l)" \
+            "Pacman installed size: $pacmanInstalledSize MiB" \
+            "AUR installed size: $aurInstalledSize MiB" \
+            "Total installed size: $totalInstalledSize MiB"
     fi
 }
 
-reptaur_query() {
-    aur_get "search/${*// /\%20}?name-desc" \
-        '.results[] | "aur/\(.Name) \(.Version)\n    \(.Description)"'
-
-    pacman -Ss "$@"
-}
+reptaur_query() { aur_query "$@"; pacman -Ss "$@"; }
 
 reptaur_install() {
-    reptaur_is_installed "$1"&& {
-        is_yes_reply "Reinstall $1"|| return 1
+    pacman_has_package "$1"&& { pacman -S "$1"; return; }
+    
+    aur_has_package "$1"&& {
+        if aur_is_package_installed "$1"; then
+            # should check for version & update if not matched
+            is_yes_reply "$1 is installed. Reinstall"&& aur_install "$1"
+        else
+            aur_install "$1"
+        fi
     }
-    pacman_has_package "$1"&& { sudo pacman -S "$1"; return; }
-
-    aur_install "$1"
 }
 
-reptaur_remove() { sudo pacman -Runss "$1"; }
+reptaur_remove() { pacman -Runss "$1"; }
 
 case $1 in
     ''|sync|-s|--sync) reptaur_sync;;
